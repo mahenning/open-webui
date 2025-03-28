@@ -18,9 +18,7 @@ from uuid import uuid4
 from concurrent.futures import ThreadPoolExecutor
 
 
-from fastapi import Request
-from fastapi import BackgroundTasks
-
+from fastapi import Request, HTTPException
 from starlette.responses import Response, StreamingResponse
 
 
@@ -198,7 +196,6 @@ async def chat_completion_tools_handler(
                     allowed_params = (
                         spec.get("parameters", {}).get("properties", {}).keys()
                     )
-                    tool_function = tool["callable"]
                     tool_function_params = {
                         k: v
                         for k, v in tool_function_params.items()
@@ -206,34 +203,50 @@ async def chat_completion_tools_handler(
                     }
 
                     if tool.get("direct", False):
-                        tool_output = await tool_function(**tool_function_params)
-                    else:
                         tool_output = await event_caller(
                             {
                                 "type": "execute:tool",
                                 "data": {
                                     "id": str(uuid4()),
-                                    "tool": tool,
+                                    "name": tool_function_name,
                                     "params": tool_function_params,
+                                    "server": tool.get("server", {}),
                                     "session_id": metadata.get("session_id", None),
                                 },
                             }
                         )
+                    else:
+                        tool_function = tool["callable"]
+                        tool_output = await tool_function(**tool_function_params)
 
                 except Exception as e:
                     tool_output = str(e)
 
+                if isinstance(tool_output, dict):
+                    tool_output = json.dumps(tool_output, indent=4)
+
                 if isinstance(tool_output, str):
-                    if tools[tool_function_name]["citation"]:
+                    tool = tools[tool_function_name]
+                    tool_id = tool.get("toolkit_id", "")
+                    if tool.get("citation", False) or tool.get("direct", False):
+
                         sources.append(
                             {
                                 "source": {
-                                    "name": f"TOOL:{tools[tool_function_name]['toolkit_id']}/{tool_function_name}"
+                                    "name": (
+                                        f"TOOL:" + f"{tool_id}/{tool_function_name}"
+                                        if tool_id
+                                        else f"{tool_function_name}"
+                                    ),
                                 },
                                 "document": [tool_output],
                                 "metadata": [
                                     {
-                                        "source": f"TOOL:{tools[tool_function_name]['toolkit_id']}/{tool_function_name}"
+                                        "source": (
+                                            f"TOOL:" + f"{tool_id}/{tool_function_name}"
+                                            if tool_id
+                                            else f"{tool_function_name}"
+                                        )
                                     }
                                 ],
                             }
@@ -245,13 +258,17 @@ async def chat_completion_tools_handler(
                                 "document": [tool_output],
                                 "metadata": [
                                     {
-                                        "source": f"TOOL:{tools[tool_function_name]['toolkit_id']}/{tool_function_name}"
+                                        "source": (
+                                            f"TOOL:" + f"{tool_id}/{tool_function_name}"
+                                            if tool_id
+                                            else f"{tool_function_name}"
+                                        )
                                     }
                                 ],
                             }
                         )
 
-                    if tools[tool_function_name]["file_handler"]:
+                    if tools[tool_function_name].get("file_handler", False):
                         skip_files = True
 
             # check if "tool_calls" in result
@@ -262,10 +279,10 @@ async def chat_completion_tools_handler(
                 await tool_call_handler(result)
 
         except Exception as e:
-            log.exception(f"Error: {e}")
+            log.debug(f"Error: {e}")
             content = None
     except Exception as e:
-        log.exception(f"Error: {e}")
+        log.debug(f"Error: {e}")
         content = None
 
     log.debug(f"tool_contexts: {sources}")
@@ -787,10 +804,10 @@ async def process_chat_payload(request, form_data, user, metadata, model):
     # Server side tools
     tool_ids = metadata.get("tool_ids", None)
     # Client side tools
-    tool_specs = form_data.get("tool_specs", None)
+    tool_servers = metadata.get("tool_servers", None)
 
     log.debug(f"{tool_ids=}")
-    log.debug(f"{tool_specs=}")
+    log.debug(f"{tool_servers=}")
 
     tools_dict = {}
 
@@ -808,14 +825,16 @@ async def process_chat_payload(request, form_data, user, metadata, model):
         )
         log.info(f"{tools_dict=}")
 
-    if tool_specs:
-        for tool in tool_specs:
-            callable = tool.pop("callable", None)
-            tools_dict[tool["name"]] = {
-                "direct": True,
-                "callable": callable,
-                "spec": tool,
-            }
+    if tool_servers:
+        for tool_server in tool_servers:
+            tool_specs = tool_server.pop("specs", [])
+
+            for tool in tool_specs:
+                tools_dict[tool["name"]] = {
+                    "spec": tool,
+                    "direct": True,
+                    "server": tool_server,
+                }
 
     if tools_dict:
         if metadata.get("function_calling") == "native":
@@ -1025,6 +1044,16 @@ async def process_chat_response(
     # Non-streaming response
     if not isinstance(response, StreamingResponse):
         if event_emitter:
+            if "error" in response:
+                error = response["error"].get("detail", response["error"])
+                Chats.upsert_message_to_chat_by_id_and_message_id(
+                    metadata["chat_id"],
+                    metadata["message_id"],
+                    {
+                        "error": {"content": error},
+                    },
+                )
+
             if "selected_model_id" in response:
                 Chats.upsert_message_to_chat_by_id_and_message_id(
                     metadata["chat_id"],
@@ -1034,7 +1063,8 @@ async def process_chat_response(
                     },
                 )
 
-            if response.get("choices", [])[0].get("message", {}).get("content"):
+            choices = response.get("choices", [])
+            if choices and choices[0].get("message", {}).get("content"):
                 content = response["choices"][0]["message"]["content"]
 
                 if content:
@@ -1153,36 +1183,41 @@ async def process_chat_response(
                     elif block["type"] == "tool_calls":
                         attributes = block.get("attributes", {})
 
-                        block_content = block.get("content", [])
+                        tool_calls = block.get("content", [])
                         results = block.get("results", [])
 
                         if results:
 
-                            result_display_content = ""
+                            tool_calls_display_content = ""
+                            for tool_call in tool_calls:
 
-                            for result in results:
-                                tool_call_id = result.get("tool_call_id", "")
-                                tool_name = ""
+                                tool_result = None
+                                for result in results:
+                                    tool_call_id = result.get("tool_call_id", "")
+                                    tool_name = ""
 
-                                for tool_call in block_content:
                                     if tool_call.get("id", "") == tool_call_id:
                                         tool_name = tool_call.get("function", {}).get(
                                             "name", ""
                                         )
+                                        tool_result = result
                                         break
 
-                                result_display_content = f"{result_display_content}\n> {tool_name}: {result.get('content', '')}"
+                                if tool_result:
+                                    tool_calls_display_content = f"{tool_calls_display_content}\nExecuted {tool_name}\n```\n{tool_call.get('function', {}).get('arguments', '')}\n```\n> {tool_result.get('content', '')}"
+                                else:
+                                    tool_calls_display_content = f"{tool_calls_display_content}\nExecuted {tool_call.get('function', {}).get('name', '')}\n```\n{tool_call.get('function', {}).get('arguments', '')}\n```"
 
                             if not raw:
-                                content = f'{content}\n<details type="tool_calls" done="true" content="{html.escape(json.dumps(block_content))}" results="{html.escape(json.dumps(results))}">\n<summary>Tool Executed</summary>\n{result_display_content}\n</details>\n'
+                                content = f'{content}\n<details type="tool_calls" done="true" content="{html.escape(json.dumps(tool_calls))}" results="{html.escape(json.dumps(results))}">\n<summary>Tool Executed</summary>\n{tool_calls_display_content}\n</details>\n'
                         else:
                             tool_calls_display_content = ""
 
-                            for tool_call in block_content:
-                                tool_calls_display_content = f"{tool_calls_display_content}\n> Executing {tool_call.get('function', {}).get('name', '')}"
+                            for tool_call in tool_calls:
+                                tool_calls_display_content = f"{tool_calls_display_content}\nExecuting {tool_call.get('function', {}).get('name', '')}\n```\n{tool_call.get('function', {}).get('arguments', '')}\n```"
 
                             if not raw:
-                                content = f'{content}\n<details type="tool_calls" done="false" content="{html.escape(json.dumps(block_content))}">\n<summary>Tool Executing...</summary>\n{tool_calls_display_content}\n</details>\n'
+                                content = f'{content}\n<details type="tool_calls" done="false" content="{html.escape(json.dumps(tool_calls))}">\n<summary>Tool Executing...</summary>\n{tool_calls_display_content}\n</details>\n'
 
                     elif block["type"] == "reasoning":
                         reasoning_display_content = "\n".join(
@@ -1539,6 +1574,16 @@ async def process_chat_response(
                                 else:
                                     choices = data.get("choices", [])
                                     if not choices:
+                                        error = data.get("error", {})
+                                        if error:
+                                            await event_emitter(
+                                                {
+                                                    "type": "chat:completion",
+                                                    "data": {
+                                                        "error": error,
+                                                    },
+                                                }
+                                            )
                                         usage = data.get("usage", {})
                                         if usage:
                                             await event_emitter(
@@ -1804,7 +1849,7 @@ async def process_chat_response(
                                     .get("properties", {})
                                     .keys()
                                 )
-                                tool_function = tool["callable"]
+
                                 tool_function_params = {
                                     k: v
                                     for k, v in tool_function_params.items()
@@ -1812,25 +1857,32 @@ async def process_chat_response(
                                 }
 
                                 if tool.get("direct", False):
-                                    tool_result = await tool_function(
-                                        **tool_function_params
-                                    )
-                                else:
                                     tool_result = await event_caller(
                                         {
                                             "type": "execute:tool",
                                             "data": {
                                                 "id": str(uuid4()),
-                                                "tool": tool,
+                                                "name": tool_name,
                                                 "params": tool_function_params,
+                                                "server": tool.get("server", {}),
                                                 "session_id": metadata.get(
                                                     "session_id", None
                                                 ),
                                             },
                                         }
                                     )
+
+                                else:
+                                    tool_function = tool["callable"]
+                                    tool_result = await tool_function(
+                                        **tool_function_params
+                                    )
+
                             except Exception as e:
                                 tool_result = str(e)
+
+                        if isinstance(tool_result, dict):
+                            tool_result = json.dumps(tool_result)
 
                         results.append(
                             {

@@ -42,7 +42,7 @@ from langchain_core.retrievers import BaseRetriever
 
 
 class VectorSearchRetriever(BaseRetriever):
-    collection_name: Any
+    collection_names: Any
     embedding_function: Any
     top_k: int
 

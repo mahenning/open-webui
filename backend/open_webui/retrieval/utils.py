@@ -52,25 +52,28 @@ class VectorSearchRetriever(BaseRetriever):
         *,
         run_manager: CallbackManagerForRetrieverRun,
     ) -> list[Document]:
-        result = VECTOR_DB_CLIENT.search(
-            collection_name=self.collection_name,
-            vectors=[self.embedding_function(query, RAG_EMBEDDING_QUERY_PREFIX)],
-            limit=self.top_k,
-        )
-
-        ids = result.ids[0]
-        metadatas = result.metadatas[0]
-        documents = result.documents[0]
-
+        distances = []
         results = []
-        for idx in range(len(ids)):
-            results.append(
-                Document(
-                    metadata=metadatas[idx],
-                    page_content=documents[idx],
-                )
+        for collection_name in self.collection_names:
+            result = VECTOR_DB_CLIENT.search(
+                collection_name=collection_name,
+                vectors=[self.embedding_function(query, RAG_EMBEDDING_QUERY_PREFIX)],
+                limit=self.top_k,
             )
-        return results
+
+            ids = result.ids[0]
+            metadatas = result.metadatas[0]
+            documents = result.documents[0]
+            distances.extend(result.distances[0])
+            for idx in range(len(ids)):
+                results.append(
+                    Document(
+                        metadata=metadatas[idx],
+                        page_content=documents[idx],
+                    )
+                )
+        results_sorted = [res for res, dist in sorted(zip(results, distances), key=lambda x: x[1], reverse=True)][:self.top_k]
+        return results_sorted
 
 
 def query_doc(
@@ -108,8 +111,8 @@ def get_doc(collection_name: str, user: UserModel = None):
 
 
 def query_doc_with_hybrid_search(
-    collection_name: str,
-    collection_result: GetResult,
+    collection_names: str,
+    collection_results: dict[str, GetResult],
     query: str,
     embedding_function,
     k: int,
@@ -119,14 +122,18 @@ def query_doc_with_hybrid_search(
 ) -> dict:
     try:
         log.debug(f"query_doc_with_hybrid_search:doc {collection_name}")
+        bm25_texts = [collection.documents[0] for collection in collection_results.values()]
+        bm25_texts = [text for document in bm25_texts for text in document]
+        bm25_meta = [collection.metadatas[0] for collection in collection_results.values()]
+        bm25_meta = [meta for document in bm25_meta for meta in document]
         bm25_retriever = BM25Retriever.from_texts(
-            texts=collection_result.documents[0],
-            metadatas=collection_result.metadatas[0],
+            texts=bm25_texts,
+            metadatas=bm25_meta,
         )
         bm25_retriever.k = k
 
         vector_search_retriever = VectorSearchRetriever(
-            collection_name=collection_name,
+            collection_names=collection_names,
             embedding_function=embedding_function,
             top_k=k,
         )
@@ -311,11 +318,11 @@ def query_collection_with_hybrid_search(
         f"Starting hybrid search for {len(queries)} queries in {len(collection_names)} collections..."
     )
 
-    def process_query(collection_name, query):
+    def process_query(collection_names, query):
         try:
             result = query_doc_with_hybrid_search(
-                collection_name=collection_name,
-                collection_result=collection_results[collection_name],
+                collection_names=collection_names,
+                collection_results=collection_results,
                 query=query,
                 embedding_function=embedding_function,
                 k=k,
@@ -331,9 +338,7 @@ def query_collection_with_hybrid_search(
     # Prepare tasks for all collections and queries
     # Avoid running any tasks for collections that failed to fetch data (have assigned None)
     tasks = [
-        (cn, q)
-        for cn in collection_names
-        if collection_results[cn] is not None
+        (collection_names, q)
         for q in queries
     ]
 

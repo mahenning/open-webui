@@ -4,6 +4,7 @@ from typing import Optional, Union
 
 import requests
 import hashlib
+import asyncio
 from concurrent.futures import ThreadPoolExecutor
 
 from huggingface_hub import snapshot_download
@@ -46,6 +47,14 @@ class VectorSearchRetriever(BaseRetriever):
     embedding_function: Any
     top_k: int
 
+    async def _get_vector(self, collection_name, query):
+        result = VECTOR_DB_CLIENT.search(
+            collection_name=collection_name,
+            vectors=[self.embedding_function(query, RAG_EMBEDDING_QUERY_PREFIX)],
+            limit=self.top_k,
+        )
+        return result
+
     def _get_relevant_documents(
         self,
         query: str,
@@ -54,12 +63,11 @@ class VectorSearchRetriever(BaseRetriever):
     ) -> list[Document]:
         distances = []
         results = []
+        loop = asyncio.get_event_loop()
         for collection_name in self.collection_names:
-            result = VECTOR_DB_CLIENT.search(
-                collection_name=collection_name,
-                vectors=[self.embedding_function(query, RAG_EMBEDDING_QUERY_PREFIX)],
-                limit=self.top_k,
-            )
+            result = loop.run_until_complete(
+                self._get_vector(collection_name, query)
+                )
 
             ids = result.ids[0]
             metadatas = result.metadatas[0]
@@ -111,8 +119,8 @@ def get_doc(collection_name: str, user: UserModel = None):
 
 
 def query_doc_with_hybrid_search(
-    collection_names: str,
-    collection_results: dict[str, GetResult],
+    collection_names: list[str],
+    collection_results: list[dict[str, GetResult]],
     query: str,
     embedding_function,
     k: int,
@@ -121,7 +129,8 @@ def query_doc_with_hybrid_search(
     r: float,
 ) -> dict:
     try:
-        log.debug(f"query_doc_with_hybrid_search:doc {collection_name}")
+        log.debug(f"query_doc_with_hybrid_search:doc {collection_names}")
+        # un-nest all docs and metadata for one bm25 search on everything
         bm25_texts = [collection.documents[0] for collection in collection_results.values()]
         bm25_texts = [text for document in bm25_texts for text in document]
         bm25_meta = [collection.metadatas[0] for collection in collection_results.values()]
@@ -178,7 +187,7 @@ def query_doc_with_hybrid_search(
         )
         return result
     except Exception as e:
-        log.exception(f"Error querying doc {collection_name} with hybrid search: {e}")
+        log.exception(f"Error querying doc {collection_names} with hybrid search: {e}")
         raise e
 
 
